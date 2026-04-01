@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Feed the Dragon</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #08000f;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+    canvas { display: block; cursor: default; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const W = canvas.width  = 800;
+const H = canvas.height = 560;
+
+// ── Constants ──────────────────────────────────────────────
+const HUNGER_MAX         = 400;   // ~6.7 s at 60 fps (with default drain rate)
+const HUNGER_DRAIN_RATE  = 0.5;   // hunger added per frame — lower = slower depletion
+const SPACE_COOLDOWN_MAX = 30;    // ~0.5 s at 60 fps
+const BURST_COUNT        = 15;    // confetti per throw
+const FEED_COOLDOWN_MS   = 1000;  // minimum ms between feeds (prevents burst multi-counting)
+// Dragon body hit ellipse at 75% scale: original rx=46,ry=30 → 34.5,22.5
+const DRAGON_HIT_RX = 35;
+const DRAGON_HIT_RY = 23;
+const CONFETTI_COLORS = ['#ff6b6b','#ffd93d','#6bcb77','#4d96ff','#ff6bb5','#c77dff','#ff9f40','#00e5ff'];
+
+// Deterministic star field
+const STARS = Array.from({length: 70}, (_, i) => ({
+  x: (i * 137.508 + 42) % W,
+  y: (i * 91.3   + 17) % (H * 0.52),
+  r: i % 5 === 0 ? 1.8 : i % 3 === 0 ? 1.2 : 0.7,
+  twinkle: i % 4 === 0
+}));
+
+// Castle geometry
+const WALL_Y     = 108;
+const MERLON_H   = 40;
+const MERLON_W   = 28;
+const MERLON_GAP = 52;
+const MAZE_Y     = WALL_Y - 35;  // character centre (feet rest on wall)
+
+// ── Game state (reset via init) ────────────────────────────
+let state, feedCount, hunger, frame;
+let confetti, fireworks, sparks, rain;
+let mazeX, dragonX, dragonDir, dragonFlash;
+let spaceCooldown, dragonBouncePhase, dragonBodyY, dragonShakeOff, feedCooldown;
+const keys = {};
+
+function init() {
+  state             = 'play';
+  feedCount         = 0;
+  hunger            = 0;
+  frame             = 0;
+  mazeX             = W / 2;
+  dragonX           = W / 2;
+  dragonDir         = 1;
+  dragonFlash       = 0;
+  spaceCooldown     = 0;
+  dragonBouncePhase = 0;
+  dragonBodyY       = H - 108;
+  dragonShakeOff    = 0;
+  feedCooldown      = 0;
+  confetti          = [];
+  fireworks         = [];
+  sparks            = [];
+  rain              = [];
+  // No initial confetti scatter — player must press SPACE
+}
+
+// ── Factory functions ──────────────────────────────────────
+function makeConfetto() {
+  return {
+    x:     mazeX + (Math.random() - 0.5) * 8,
+    y:     MAZE_Y + 22,
+    vx:    (Math.random() - 0.5) * 2,
+    vy:    Math.random() * 2.5 + 1.5,
+    color: CONFETTI_COLORS[Math.floor(Math.random() * CONFETTI_COLORS.length)],
+    size:  Math.random() * 5 + 3,
+    rot:   Math.random() * Math.PI * 2,
+    rotV:  (Math.random() - 0.5) * 0.14,
+    rect:  Math.random() > 0.45
+  };
+}
+
+function makeFirework() {
+  return {
+    x:    60 + Math.random() * (W - 120),
+    y:    H,
+    vy:  -(Math.random() * 9 + 9),
+    hue:  Math.floor(Math.random() * 360),
+    done: false
+  };
+}
+
+function explode(fw) {
+  const n = 55;
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2 + Math.random() * 0.3;
+    const s = Math.random() * 5 + 2;
+    sparks.push({
+      x: fw.x, y: fw.y,
+      vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      hue: fw.hue + Math.random() * 40 - 20,
+      life: 1, decay: Math.random() * 0.016 + 0.008
+    });
+  }
+}
+
+function makeRainDrop(scatter) {
+  return {
+    x:   mazeX + (Math.random() - 0.5) * 80,
+    y:   scatter ? Math.random() * H : MAZE_Y - 30,
+    vy:  Math.random() * 6 + 6,
+    len: Math.random() * 14 + 8
+  };
+}
+
+// ── Update ─────────────────────────────────────────────────
+function update() {
+  frame++;
+
+  if (state === 'play') {
+    // Move Maze
+    if (keys['ArrowLeft'])  mazeX = Math.max(22, mazeX - 5);
+    if (keys['ArrowRight']) mazeX = Math.min(W - 22, mazeX + 5);
+
+    // Spacebar burst with cooldown
+    if (spaceCooldown > 0) spaceCooldown--;
+    if (keys[' '] && spaceCooldown === 0) {
+      spaceCooldown = SPACE_COOLDOWN_MAX;
+      for (let i = 0; i < BURST_COUNT; i++) confetti.push(makeConfetto());
+    }
+
+    // Dragon movement — speed and erratic-ness grow with feedCount
+    const baseSpeed   = 1.3 + feedCount * 0.28;
+    const erraticProb = feedCount * 0.009;
+    if (Math.random() < erraticProb) dragonDir *= -1;
+    dragonX += baseSpeed * dragonDir;
+    if (dragonX > W - 60) dragonDir = -1;
+    if (dragonX < 60)     dragonDir =  1;
+
+    // Flash countdown
+    if (dragonFlash > 0) dragonFlash--;
+    if (feedCooldown > 0) feedCooldown--;
+
+    // Bounce: decaying sine wave upward
+    if (dragonBouncePhase > 0) dragonBouncePhase--;
+    const bounceOff = dragonBouncePhase > 0
+      ? -Math.abs(Math.sin(dragonBouncePhase * 0.18)) * 15
+      : 0;
+    dragonBodyY = H - 108 + bounceOff;
+
+    // Distress shake at critical hunger
+    const distress = hunger / HUNGER_MAX;
+    dragonShakeOff = distress > 0.85
+      ? (Math.random() - 0.5) * 5
+      : 0;
+
+    // Update confetti + ellipse collision against 75%-scaled body
+    for (let i = confetti.length - 1; i >= 0; i--) {
+      const c = confetti[i];
+      c.x   += c.vx;
+      c.y   += c.vy;
+      c.rot += c.rotV;
+
+      const dx = c.x - (dragonX + dragonShakeOff);
+      const dy = c.y - dragonBodyY;
+      const inBody =
+        (dx * dx) / (DRAGON_HIT_RX * DRAGON_HIT_RX) +
+        (dy * dy) / (DRAGON_HIT_RY * DRAGON_HIT_RY) <= 1;
+
+      if (inBody) {
+        confetti.splice(i, 1);
+        if (feedCooldown === 0) {
+          // First hit from this burst — count as a feed
+          const feedCooldownFrames = Math.round(FEED_COOLDOWN_MS / 1000 * 60);
+          feedCount++;
+          hunger            = 0;
+          dragonFlash       = 40;
+          dragonBouncePhase = 28;
+          feedCooldown      = feedCooldownFrames;
+          if (feedCount >= 5) { state = 'win'; return; }
+        }
+        // Remaining confetti from same burst: silently removed, no feed counted
+        continue;
+      }
+
+      if (c.y > H + 12 || c.x < -12 || c.x > W + 12) confetti.splice(i, 1);
+    }
+
+    // Hunger timer
+    hunger += HUNGER_DRAIN_RATE;
+    if (hunger >= HUNGER_MAX) state = 'lose';
+
+  } else if (state === 'win') {
+    if (frame % 18 === 0) fireworks.push(makeFirework());
+    for (let i = fireworks.length - 1; i >= 0; i--) {
+      const fw = fireworks[i];
+      fw.y  += fw.vy;
+      fw.vy += 0.14;
+      if (fw.y < H * 0.52 && !fw.done) {
+        fw.done = true; explode(fw); fireworks.splice(i, 1);
+      }
+    }
+    for (let i = sparks.length - 1; i >= 0; i--) {
+      const s = sparks[i];
+      s.x += s.vx; s.y += s.vy; s.vy += 0.07;
+      s.life -= s.decay;
+      if (s.life <= 0) sparks.splice(i, 1);
+    }
+
+  } else if (state === 'lose') {
+    while (rain.length < 90) rain.push(makeRainDrop(true));
+    for (let i = rain.length - 1; i >= 0; i--) {
+      rain[i].y += rain[i].vy;
+      if (rain[i].y > H + 20) rain.splice(i, 1);
+    }
+  }
+}
+
+// ── Drawing helpers ────────────────────────────────────────
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, r);
+}
+
+function drawBg() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0,    '#080020');
+  g.addColorStop(0.55, '#180848');
+  g.addColorStop(1,    '#3a1040');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  STARS.forEach(s => {
+    ctx.globalAlpha = s.twinkle ? 0.6 + 0.4 * Math.sin(frame * 0.04 + s.x) : 1;
+    ctx.fillStyle   = 'white';
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+
+  // Moon (crescent)
+  ctx.fillStyle = '#fffce0';
+  ctx.beginPath(); ctx.arc(W - 85, 58, 30, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#130038';
+  ctx.beginPath(); ctx.arc(W - 72, 50, 26, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawGround() {
+  ctx.fillStyle = '#1a3a0a';
+  ctx.fillRect(0, H - 55, W, 55);
+  ctx.fillStyle = '#2d6318';
+  ctx.fillRect(0, H - 55, W, 16);
+  ctx.fillStyle = '#3a7a20';
+  for (let x = 4; x < W; x += 38) {
+    ctx.beginPath();
+    ctx.ellipse(x + 18, H - 55, 20, 9, 0, Math.PI, 0);
+    ctx.fill();
+  }
+}
+
+function drawCastle() {
+  ctx.fillStyle = '#7a6850';
+  ctx.fillRect(0, WALL_Y, W, 42);
+  ctx.fillStyle = '#5a4830';
+  ctx.fillRect(0, WALL_Y + 34, W, 6);
+  ctx.strokeStyle = '#5a4830'; ctx.lineWidth = 1;
+  for (let x = 0; x < W; x += 48) {
+    ctx.beginPath(); ctx.moveTo(x, WALL_Y); ctx.lineTo(x, WALL_Y + 42); ctx.stroke();
+  }
+  for (let x = 8; x < W; x += MERLON_GAP + MERLON_W) {
+    ctx.fillStyle = '#8a7860';
+    roundRect(x, WALL_Y - MERLON_H, MERLON_W, MERLON_H + 2, [5, 5, 0, 0]); ctx.fill();
+    ctx.strokeStyle = '#5a4830'; ctx.lineWidth = 1;
+    roundRect(x, WALL_Y - MERLON_H, MERLON_W, MERLON_H + 2, [5, 5, 0, 0]); ctx.stroke();
+  }
+}
+
+function drawMaze(x) {
+  const y = MAZE_Y;
+
+  // Back hair
+  ctx.fillStyle = '#c8a070';
+  ctx.beginPath();
+  ctx.ellipse(x, y - 10, 12, 16, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillRect(x - 12, y - 12, 5, 24);
+  ctx.fillRect(x + 7,  y - 12, 5, 24);
+
+  // Face
+  ctx.fillStyle = '#fabaa0';
+  ctx.beginPath(); ctx.arc(x, y - 13, 10, 0, Math.PI * 2); ctx.fill();
+
+  // Hair top / fringe
+  ctx.fillStyle = '#c8a070';
+  ctx.beginPath(); ctx.arc(x, y - 19, 10, Math.PI, 0); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(x - 10, y - 20);
+  ctx.quadraticCurveTo(x - 5, y - 28, x, y - 26);
+  ctx.quadraticCurveTo(x + 5, y - 28, x + 10, y - 20);
+  ctx.fill();
+
+  // Eyes
+  ctx.fillStyle = '#2a1a0a';
+  ctx.beginPath(); ctx.arc(x - 3.5, y - 14, 1.8, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + 3.5, y - 14, 1.8, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = 'white';
+  ctx.beginPath(); ctx.arc(x - 2.5, y - 15, 0.7, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + 4.5, y - 15, 0.7, 0, Math.PI * 2); ctx.fill();
+
+  // Rosy cheeks
+  ctx.fillStyle = 'rgba(255,120,100,0.25)';
+  ctx.beginPath(); ctx.ellipse(x - 7, y - 11, 4, 2.5, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(x + 7, y - 11, 4, 2.5, 0, 0, Math.PI * 2); ctx.fill();
+
+  // Smile
+  ctx.strokeStyle = '#b06050'; ctx.lineWidth = 1.3;
+  ctx.beginPath(); ctx.arc(x, y - 10, 3.8, 0.1, Math.PI - 0.1); ctx.stroke();
+
+  // Dress
+  ctx.fillStyle = '#7b2d9b';
+  ctx.beginPath();
+  ctx.moveTo(x - 8, y - 3); ctx.lineTo(x + 8, y - 3);
+  ctx.lineTo(x + 14, y + 23); ctx.lineTo(x - 14, y + 23);
+  ctx.closePath(); ctx.fill();
+
+  // Dress highlight
+  ctx.fillStyle = '#9b4dbb';
+  ctx.beginPath();
+  ctx.moveTo(x - 5, y - 3); ctx.lineTo(x + 5, y - 3);
+  ctx.lineTo(x + 8, y + 10); ctx.lineTo(x - 8, y + 10);
+  ctx.closePath(); ctx.fill();
+
+  // Belt
+  ctx.fillStyle = '#5b1a7b';
+  ctx.fillRect(x - 8, y + 4, 16, 4);
+
+  // Arms
+  ctx.strokeStyle = '#fabaa0'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x - 8, y); ctx.lineTo(x - 16, y + 12); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x + 8, y); ctx.lineTo(x + 16, y + 12); ctx.stroke();
+  ctx.lineCap = 'butt';
+
+  // Legs
+  ctx.fillStyle = '#e0a888';
+  ctx.fillRect(x - 8, y + 21, 6, 14);
+  ctx.fillRect(x + 2, y + 21, 6, 14);
+
+  // Shoes
+  ctx.fillStyle = '#5b1a7b';
+  ctx.beginPath(); ctx.ellipse(x - 5, y + 35, 6, 3.5, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(x + 5, y + 35, 6, 3.5, 0, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawDragon(x) {
+  // dragonBodyY includes bounce offset; dragonShakeOff adds distress jitter
+  const cx  = x + dragonShakeOff;  // render centre x
+  const cy  = dragonBodyY;          // render centre y
+  const distress = hunger / HUNGER_MAX; // 0 = fine, 1 = starving
+
+  // ── All dragon geometry is drawn at 75% scale around (cx, cy) ──
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(0.75, 0.75);
+  ctx.translate(-cx, -cy);
+
+  const fl   = dragonFlash > 0 && Math.floor(dragonFlash / 5) % 2 === 0;
+  // Body tints toward pale/grey when very distressed
+  const bodyBase  = fl ? '#ffe880' : (distress > 0.75 ? '#f0d040' : '#ffe033');
+  const bellyBase = fl ? '#fffcc0' : (distress > 0.75 ? '#f8eeaa' : '#fff5a0');
+  const wing    = '#ffaad0';
+  const outline = '#cc9900';
+
+  // Tail
+  ctx.fillStyle = bodyBase;
+  ctx.beginPath();
+  ctx.moveTo(cx + 40, cy + 8);
+  ctx.quadraticCurveTo(cx + 90, cy + 28, cx + 80, cy - 18);
+  ctx.quadraticCurveTo(cx + 68, cy - 28, cx + 52, cy);
+  ctx.closePath(); ctx.fill();
+
+  // Left wing
+  ctx.fillStyle = wing;
+  ctx.beginPath();
+  ctx.moveTo(cx - 6,  cy - 10);
+  ctx.lineTo(cx - 60, cy - 65);
+  ctx.lineTo(cx - 50, cy - 20);
+  ctx.lineTo(cx - 22, cy + 8);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#ff88b0'; ctx.lineWidth = 1;
+  [[-6,-10,-60,-65],[-6,-10,-34,-38],[-22,-6,-50,-32]].forEach(([x1,y1,x2,y2]) => {
+    ctx.beginPath(); ctx.moveTo(cx+x1,cy+y1); ctx.lineTo(cx+x2,cy+y2); ctx.stroke();
+  });
+
+  // Right wing
+  ctx.fillStyle = wing;
+  ctx.beginPath();
+  ctx.moveTo(cx + 6,  cy - 10);
+  ctx.lineTo(cx + 60, cy - 65);
+  ctx.lineTo(cx + 50, cy - 20);
+  ctx.lineTo(cx + 22, cy + 8);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#ff88b0'; ctx.lineWidth = 1;
+  [[6,-10,60,-65],[6,-10,34,-38],[22,-6,50,-32]].forEach(([x1,y1,x2,y2]) => {
+    ctx.beginPath(); ctx.moveTo(cx+x1,cy+y1); ctx.lineTo(cx+x2,cy+y2); ctx.stroke();
+  });
+
+  // Body
+  ctx.fillStyle = bodyBase;
+  ctx.beginPath(); ctx.ellipse(cx, cy, 46, 30, 0, 0, Math.PI * 2); ctx.fill();
+
+  // Belly
+  ctx.fillStyle = bellyBase;
+  ctx.beginPath(); ctx.ellipse(cx, cy + 7, 28, 18, 0, 0, Math.PI * 2); ctx.fill();
+
+  // Back spines
+  ctx.fillStyle = outline;
+  [[-4,-30],[10,-36],[24,-33],[36,-27]].forEach(([sx,sy]) => {
+    ctx.beginPath();
+    ctx.moveTo(cx+sx-5, cy+sy+10); ctx.lineTo(cx+sx, cy+sy); ctx.lineTo(cx+sx+5, cy+sy+10);
+    ctx.closePath(); ctx.fill();
+  });
+
+  // Head
+  ctx.fillStyle = bodyBase;
+  ctx.beginPath(); ctx.ellipse(cx - 43, cy - 13, 23, 18, -0.2, 0, Math.PI * 2); ctx.fill();
+
+  // Snout
+  ctx.beginPath(); ctx.ellipse(cx - 62, cy - 10, 14, 10, 0.1, 0, Math.PI * 2); ctx.fill();
+
+  // Nostrils
+  ctx.fillStyle = '#aa7700';
+  ctx.beginPath(); ctx.ellipse(cx-68, cy-13, 2.5, 2,  0.3, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(cx-64, cy-8,  2.5, 2, -0.3, 0, Math.PI * 2); ctx.fill();
+
+  // Mouth — smile normally, frown when distressed
+  ctx.strokeStyle = '#aa7700'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  if (distress > 0.65) {
+    // Frown
+    ctx.moveTo(cx - 72, cy - 9);
+    ctx.quadraticCurveTo(cx - 62, cy - 14, cx - 52, cy - 11);
+  } else {
+    // Smile
+    ctx.moveTo(cx - 72, cy - 7);
+    ctx.quadraticCurveTo(cx - 62, cy - 2, cx - 52, cy - 5);
+  }
+  ctx.stroke();
+
+  // Eye white
+  ctx.fillStyle = 'white';
+  ctx.beginPath(); ctx.ellipse(cx - 48, cy - 19, 8, 7, 0, 0, Math.PI * 2); ctx.fill();
+  // Iris
+  ctx.fillStyle = '#40a000';
+  ctx.beginPath(); ctx.ellipse(cx - 47, cy - 19, 6, 6, 0, 0, Math.PI * 2); ctx.fill();
+  // Pupil — oval/squished when distressed
+  ctx.fillStyle = '#0a1800';
+  if (distress > 0.65) {
+    ctx.beginPath(); ctx.ellipse(cx - 46, cy - 19, 2, 4, 0, 0, Math.PI * 2); ctx.fill();
+  } else {
+    ctx.beginPath(); ctx.arc(cx - 46, cy - 19, 3.5, 0, Math.PI * 2); ctx.fill();
+  }
+  // Shine
+  ctx.fillStyle = 'white';
+  ctx.beginPath(); ctx.arc(cx - 44, cy - 21, 1.4, 0, Math.PI * 2); ctx.fill();
+
+  // Eyebrow — flat normally, worried-angled when distressed
+  ctx.strokeStyle = '#cc9900'; ctx.lineWidth = 2.2;
+  ctx.beginPath();
+  if (distress > 0.5) {
+    // Inner corner raised = worried V-shape
+    ctx.moveTo(cx - 56, cy - 25); ctx.lineTo(cx - 40, cy - 32);
+  } else {
+    ctx.moveTo(cx - 56, cy - 28); ctx.lineTo(cx - 40, cy - 29);
+  }
+  ctx.stroke();
+
+  // Sweat drops when critically hungry
+  if (distress > 0.75) {
+    ctx.fillStyle = 'rgba(80,180,255,0.85)';
+    // Drop near forehead
+    ctx.beginPath();
+    ctx.arc(cx - 30, cy - 38, 3.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(cx - 30, cy - 34);
+    ctx.lineTo(cx - 33, cy - 28);
+    ctx.lineTo(cx - 27, cy - 28);
+    ctx.closePath(); ctx.fill();
+    // Second drop, slightly offset
+    ctx.globalAlpha = 0.6;
+    ctx.beginPath(); ctx.arc(cx - 18, cy - 44, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(cx - 18, cy - 41);
+    ctx.lineTo(cx - 21, cy - 36);
+    ctx.lineTo(cx - 15, cy - 36);
+    ctx.closePath(); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // Horns
+  ctx.fillStyle = outline;
+  ctx.beginPath(); ctx.moveTo(cx-34,cy-28); ctx.lineTo(cx-28,cy-54); ctx.lineTo(cx-22,cy-28); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(cx-20,cy-27); ctx.lineTo(cx-14,cy-50); ctx.lineTo(cx- 8,cy-27); ctx.closePath(); ctx.fill();
+
+  // Legs
+  ctx.fillStyle = bodyBase;
+  roundRect(cx - 36, cy + 22, 17, 20, 5); ctx.fill();
+  roundRect(cx + 18, cy + 22, 17, 20, 5); ctx.fill();
+
+  // Claws
+  ctx.fillStyle = outline;
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath(); ctx.moveTo(cx-38+i*7, cy+42); ctx.lineTo(cx-41+i*7, cy+51); ctx.lineTo(cx-35+i*7, cy+42); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(cx+16+i*7, cy+42); ctx.lineTo(cx+13+i*7, cy+51); ctx.lineTo(cx+19+i*7, cy+42); ctx.closePath(); ctx.fill();
+  }
+
+  ctx.restore(); // ── end 75% scale ──
+
+  // Hearts drawn outside scale transform (full size, above dragon)
+  if (state === 'play') {
+    for (let i = 0; i < feedCount; i++) {
+      drawHeart(cx - 44 + i * 20, dragonBodyY - 62, 8, '#ff3377');
+    }
+  }
+}
+
+function drawHeart(cx, cy, r, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy + r * 0.45);
+  ctx.bezierCurveTo(cx, cy, cx - r, cy, cx - r, cy + r * 0.45);
+  ctx.bezierCurveTo(cx - r, cy + r * 0.9, cx, cy + r * 1.35, cx, cy + r * 1.6);
+  ctx.bezierCurveTo(cx, cy + r * 1.35, cx + r, cy + r * 0.9, cx + r, cy + r * 0.45);
+  ctx.bezierCurveTo(cx + r, cy, cx, cy, cx, cy + r * 0.45);
+  ctx.closePath(); ctx.fill();
+}
+
+function drawConfetti() {
+  confetti.forEach(c => {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.rotate(c.rot);
+    ctx.fillStyle = c.color;
+    if (c.rect) {
+      ctx.fillRect(-c.size / 2, -c.size / 4, c.size, c.size / 2);
+    } else {
+      ctx.beginPath(); ctx.ellipse(0, 0, c.size / 2, c.size / 3, 0, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  });
+}
+
+function drawHungerBar() {
+  const bw = 230, bh = 18, bx = W / 2 - bw / 2, by = 13;
+  const ratio = Math.max(0, 1 - hunger / HUNGER_MAX);
+  const hue   = ratio > 0.5 ? 120 : ratio > 0.25 ? 40 : 0;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(bx - 2, by - 2, bw + 4, bh + 4, 6); ctx.fill();
+
+  ctx.fillStyle = `hsl(${hue},90%,45%)`;
+  roundRect(bx, by, bw * ratio, bh, 4); ctx.fill();
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 1.5;
+  roundRect(bx, by, bw, bh, 4); ctx.stroke();
+
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('Dragon Hunger', W / 2, by - 4);
+}
+
+function drawSpaceHint() {
+  const ready = spaceCooldown === 0;
+  const bx = W / 2 - 130, by = H - 36, bw = 260, bh = 26;
+
+  // Background pill
+  ctx.fillStyle = ready ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.35)';
+  roundRect(bx, by, bw, bh, 13); ctx.fill();
+
+  // Cooldown fill
+  if (!ready) {
+    const prog = 1 - spaceCooldown / SPACE_COOLDOWN_MAX;
+    ctx.fillStyle = 'rgba(180,100,255,0.35)';
+    roundRect(bx, by, bw * prog, bh, 13); ctx.fill();
+  }
+
+  ctx.fillStyle = ready ? 'rgba(255,255,255,0.9)' : 'rgba(200,180,255,0.65)';
+  ctx.font = ready ? 'bold 13px sans-serif' : '13px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(
+    ready ? 'Press SPACE to throw confetti' : 'Reloading...',
+    W / 2, by + 17
+  );
+}
+
+function drawRain() {
+  ctx.strokeStyle = 'rgba(140,185,255,0.65)'; ctx.lineWidth = 1.2;
+  rain.forEach(r => {
+    ctx.beginPath(); ctx.moveTo(r.x, r.y); ctx.lineTo(r.x - 2, r.y + r.len); ctx.stroke();
+  });
+}
+
+function drawFireworks() {
+  fireworks.forEach(fw => {
+    ctx.fillStyle = `hsl(${fw.hue},100%,65%)`;
+    ctx.beginPath(); ctx.arc(fw.x, fw.y, 3, 0, Math.PI * 2); ctx.fill();
+  });
+  sparks.forEach(s => {
+    ctx.globalAlpha = Math.max(0, s.life);
+    ctx.fillStyle   = `hsl(${s.hue},100%,65%)`;
+    ctx.beginPath(); ctx.arc(s.x, s.y, 2.5, 0, Math.PI * 2); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+}
+
+const BTN = { x: W/2 - 85, y: H/2 + 58, w: 170, h: 46 };
+
+function drawPanel(msg, sub, boxColor, borderColor, btnColor, btnLabel) {
+  ctx.fillStyle = boxColor;
+  roundRect(W/2 - 230, H/2 - 78, 460, 160, 20); ctx.fill();
+  ctx.strokeStyle = borderColor; ctx.lineWidth = 3;
+  roundRect(W/2 - 230, H/2 - 78, 460, 160, 20); ctx.stroke();
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffffff'; ctx.font = 'bold 30px sans-serif';
+  ctx.fillText(msg, W/2, H/2 - 28);
+  ctx.font = '17px sans-serif'; ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.fillText(sub, W/2, H/2 + 8);
+
+  ctx.fillStyle = btnColor;
+  roundRect(BTN.x, BTN.y, BTN.w, BTN.h, 12); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 2;
+  roundRect(BTN.x, BTN.y, BTN.w, BTN.h, 12); ctx.stroke();
+  ctx.fillStyle = 'white'; ctx.font = 'bold 20px sans-serif';
+  ctx.fillText(btnLabel, W/2, BTN.y + 31);
+}
+
+// ── Main draw ──────────────────────────────────────────────
+function draw() {
+  drawBg();
+
+  if (state === 'lose') drawRain();
+
+  drawGround();
+  drawCastle();
+
+  if (state === 'play') drawConfetti();
+
+  drawMaze(mazeX);
+  drawDragon(dragonX);
+
+  if (state === 'play') {
+    drawHungerBar();
+
+    // Feed counter
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.font      = 'bold 15px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Fed: ${feedCount} / 5`, 14, 50);
+
+    drawSpaceHint();
+  }
+
+  if (state === 'win') {
+    drawFireworks();
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, 0, W, H);
+    drawPanel('You fed the dragon!', 'The dragon is so happy! ♥',
+      'rgba(255,225,50,0.95)', '#ffaa00', '#7b2d9b', 'Play Again');
+  }
+
+  if (state === 'lose') {
+    ctx.fillStyle = 'rgba(5,15,60,0.6)';
+    ctx.fillRect(0, 0, W, H);
+    drawPanel('The dragon is still hungry...', 'Feed faster next time!',
+      'rgba(18,38,100,0.95)', '#4466ee', '#1a3599', 'Try Again');
+  }
+}
+
+// ── Input ──────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (['ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.key] = false; });
+
+canvas.addEventListener('click', e => {
+  if (state === 'play') return;
+  const r  = canvas.getBoundingClientRect();
+  const mx = (e.clientX - r.left) * (W / r.width);
+  const my = (e.clientY - r.top)  * (H / r.height);
+  if (mx >= BTN.x && mx <= BTN.x + BTN.w && my >= BTN.y && my <= BTN.y + BTN.h) init();
+});
+
+// ── Loop ───────────────────────────────────────────────────
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+init();
+loop();
+</script>
+</body>
+</html>
